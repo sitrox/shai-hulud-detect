@@ -5,6 +5,26 @@ All notable changes to the Shai-Hulud NPM Supply Chain Attack Detector will be d
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.20.0] - 2026-08-05
+
+### Fixed
+- **A symlinked scan root scanned nothing and reported clean.** `find` does not descend a start path that is itself a symlink, and both `main()` and `run_bulk_scan` normalised paths with the default **logical** `pwd`, which preserves the symlink. The result was the worst failure mode this tool has: a full pass, exit 0, `✅ No indicators of Shai-Hulud compromise detected` — for a tree that was never opened.
+  - Measured on a real machine where `/work` is a symlink to `/Volumes/Work`: `--bulk --bulk-list /work` reported **`No projects found under: /work — nothing to do`**. After the fix, the same command discovers **698 projects**. A plain scan of `/work/<project>` likewise collected zero files.
+  - Passing a trailing slash (`/work/`) does make `find` resolve the link, but the logical `pwd` strips it again, so that workaround failed identically — there was no way to scan such a root correctly.
+  - Symlinked roots are ordinary, not exotic: `/work -> /Volumes/Work` and `/opt/<x> -> …` in corporate layouts, macOS's own `/tmp -> /private/tmp`, and anything bind-mount-shaped. `pwd -P` is now used in all three normalisation sites, so `find`, `GREP_BASE` and the reports all see a real path.
+
+- **`--bulk` rows could contradict themselves, e.g. `🟡 MEDIUM RISK (H:4 M:0 L:0)`.** `trufflehog_activity.txt` stores `path:SEVERITY:message` and mixes HIGH, MEDIUM and LOW, but the `--save-log` and `--json` writers dumped the **whole file** into the HIGH bucket (`cut -d: -f1`, discarding the severity field). A file that merely mentions trufflehog is a MEDIUM finding, so it was recorded as HIGH.
+  - In `--bulk` the row label comes from the child's exit code (correctly MEDIUM) while the counts are parsed from the log (wrongly HIGH) — hence rows that say MEDIUM next to `H:4`. `--json` was affected identically, marking every trufflehog finding HIGH, which matters more since that output is meant to be machine-consumed.
+  - Each severity is now emitted into its own section, matching what `crypto_patterns.txt` already did. The `--json` message no longer carries a redundant `HIGH:`/`MEDIUM:` prefix.
+- **`--bulk-output` inside a scan root was scanned as a project again.** `_bulk_resolve_abs` did not resolve symlinks, so once discovery started returning physical paths the two could not be compared — on macOS `mktemp -d` yields `/var/folders/…` while the physical path is `/private/var/folders/…`. Caught by the existing hardening test from 3.2.1.
+
+### Added
+- **Four assertions**: a symlinked root for both a plain scan and `--bulk` discovery, and trufflehog severity in both `--save-log` and `--json`. All fail on the unpatched code.
+
+### Changed
+- **`shai-hulud-detector.sh`**: `SCRIPT_VERSION` 3.19.0 → 3.20.0. Scan targets and bulk roots are now reported as their resolved physical paths.
+- **`README.md`**: tests badge/count 238 → 240.
+
 ## [3.18.0] - 2026-08-05
 
 ### Fixed
@@ -83,7 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **`shai-hulud-detector.sh`**: `SCRIPT_VERSION` 3.14.1 → 3.15.0. The progress line now reads `Checking <n> files for known malicious content (of <m> collected)` — previously `<n> priority files … (filtered from <m> total)`, which is no longer accurate now that nothing is filtered out.
-- **`README.md`**: tests badge/count 238 → 240.
+- **`README.md`**: tests badge/count 271 → 275.
 ## [3.14.2] - 2026-08-05
 
 ### Fixed

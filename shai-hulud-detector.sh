@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPROMISED_PACKAGES_FILE="$SCRIPT_DIR/compromised-packages.txt"
 
 # Tool version (surfaced in --json output for downstream consumers)
-SCRIPT_VERSION="3.18.0"
+SCRIPT_VERSION="3.20.0"
 
 # Global temp directory for file-based storage
 TEMP_DIR=""
@@ -5508,7 +5508,7 @@ write_log_file() {
         [[ -s "$TEMP_DIR/compromised_found.txt" ]] && cut -d: -f1 "$TEMP_DIR/compromised_found.txt" || true
 
         # Trufflehog activity (extract file path before colon)
-        [[ -s "$TEMP_DIR/trufflehog_activity.txt" ]] && cut -d: -f1 "$TEMP_DIR/trufflehog_activity.txt" || true
+        _trufflehog_by_severity HIGH || true
 
         # Shai-Hulud repos
         [[ -s "$TEMP_DIR/shai_hulud_repos.txt" ]] && cat "$TEMP_DIR/shai_hulud_repos.txt" || true
@@ -5522,6 +5522,8 @@ write_log_file() {
     # MEDIUM RISK files
     echo "# MEDIUM" >> "$log_file"
     {
+        # Trufflehog rows graded MEDIUM (see _trufflehog_by_severity)
+        _trufflehog_by_severity MEDIUM || true
         # Suspicious packages (extract file path)
         # Note: Using || true to prevent pipefail from causing non-zero exit on empty files
         [[ -s "$TEMP_DIR/suspicious_found.txt" ]] && cut -d: -f1 "$TEMP_DIR/suspicious_found.txt" || true
@@ -5568,6 +5570,8 @@ write_log_file() {
 
         # Namespace warnings (has full paths in format: /path/to/file:namespace_info)
         [[ -s "$TEMP_DIR/namespace_warnings.txt" ]] && cut -d: -f1 "$TEMP_DIR/namespace_warnings.txt" || true
+        # Trufflehog rows graded LOW (see _trufflehog_by_severity)
+        _trufflehog_by_severity LOW || true
     } | sort -u >> "$log_file"
 
     print_status "$GREEN" "Log saved to: $log_file"
@@ -5622,6 +5626,29 @@ _jf_path() {
 
 # _jf_pathmsg SEVERITY FILE  -> each line is "path:reason"; split on FIRST colon
 # (mirrors `cut -d: -f1` for the path, but keeps the reason as the message).
+# Function: _trufflehog_by_severity
+# Purpose: trufflehog_activity.txt stores entries as "path:SEVERITY:message" and mixes
+#          HIGH, MEDIUM and LOW in one file. Emit only the rows of one severity.
+# Args: $1 = "HIGH" | "MEDIUM" | "LOW"; $2 = "paths" (default) or "pathmsg"
+# Note: The --save-log and --json writers used to dump the WHOLE file as HIGH, so a
+#       file that merely mentions trufflehog — a MEDIUM finding — was recorded as HIGH.
+#       In --bulk that produced rows like "🟡 MEDIUM RISK (H:4 M:0 L:0)": the label
+#       comes from the child exit code (correctly MEDIUM) while the counts come from
+#       the log (wrongly HIGH). The crypto_patterns writer already filtered this way.
+_trufflehog_by_severity() {
+    local want="$1" mode="${2:-paths}"
+    [[ -s "$TEMP_DIR/trufflehog_activity.txt" ]] || return 0
+    awk -F: -v want="$want" -v mode="$mode" '
+        $2 == want {
+            if (mode == "paths") { print $1; next }
+            rest = $0
+            sub(/^[^:]*:[^:]*:/, "", rest)
+            print $1 ":" rest
+        }
+    ' "$TEMP_DIR/trufflehog_activity.txt"
+    return 0
+}
+
 _jf_pathmsg() {
     local sev="$1" f="$2" line path msg
     [[ -s "$f" ]] || return 0
@@ -5695,7 +5722,9 @@ write_json_file() {
         _jf_path    HIGH "Shai-Hulud runner reference"                     "$TEMP_DIR/github_sha1hulud_runners.txt"
         _jf_path    HIGH "Known malicious repository description marker"    "$TEMP_DIR/malicious_repo_descriptions.txt"
         _jf_pathmsg HIGH "$TEMP_DIR/compromised_found.txt"
-        _jf_pathmsg HIGH "$TEMP_DIR/trufflehog_activity.txt"
+        _trufflehog_by_severity HIGH   pathmsg | _jf_pathmsg_stdin HIGH
+        _trufflehog_by_severity MEDIUM pathmsg | _jf_pathmsg_stdin MEDIUM
+        _trufflehog_by_severity LOW    pathmsg | _jf_pathmsg_stdin LOW
         _jf_path    HIGH "Shai-Hulud marker repository"                    "$TEMP_DIR/shai_hulud_repos.txt"
         [[ -s "$TEMP_DIR/crypto_patterns.txt" ]] && \
             grep -E "(HIGH RISK|Known attacker wallet)" "$TEMP_DIR/crypto_patterns.txt" 2>/dev/null | _jf_pathmsg_stdin HIGH || true
@@ -6695,11 +6724,23 @@ _bulk_is_in_output_dir() {
 _bulk_resolve_abs() {
     local p="$1"
     [[ -z "$p" ]] && return 0
-    if [[ "$p" == /* ]]; then
-        printf '%s\n' "$p"
-    else
-        printf '%s/%s\n' "$PWD" "$p"
-    fi
+    [[ "$p" == /* ]] || p="$PWD/$p"
+
+    # Resolve symlinks, so this is comparable with discovery output — which uses
+    # `pwd -P`. Without this the output directory is not recognised as being inside a
+    # scan root and gets scanned as if it were a project: on macOS `mktemp -d` hands
+    # back /var/folders/… while the physical path is /private/var/folders/…, so the
+    # string comparison never matched.
+    #
+    # The directory usually does not exist yet, so resolve the deepest existing
+    # ancestor and re-append the part that does not exist.
+    local head="$p" tail=""
+    while [[ "$head" != "/" && -n "$head" && ! -d "$head" ]]; do
+        tail="$(basename "$head")${tail:+/$tail}"
+        head="$(dirname "$head")"
+    done
+    [[ -d "$head" ]] && head="$(cd "$head" && pwd -P)"
+    printf '%s\n' "${head%/}${tail:+/$tail}"
 }
 
 # Function: _bulk_collect_unreadable
@@ -7091,7 +7132,7 @@ run_bulk_scan() {
             print_status "$YELLOW" "⚠️  Skipping parent '$root' — not a directory."
             continue
         fi
-        root="$(cd "$root" && pwd)"
+        root="$(cd "$root" && pwd -P)"   # -P: resolve symlinks, see main()
         local _child_orig
         while IFS= read -r child; do
             [[ -d "$child" ]] || continue                       # follows symlinks; drops broken links
@@ -7189,7 +7230,7 @@ run_bulk_scan() {
     local resolved_roots="" r
     for r in "${roots[@]}"; do
         [[ -d "$r" ]] || continue
-        resolved_roots+="${resolved_roots:+, }$(cd "$r" && pwd)"
+        resolved_roots+="${resolved_roots:+, }$(cd "$r" && pwd -P)"
     done
 
     print_status "$GREEN" "Bulk scan: ${#targets[@]} project director$([[ ${#targets[@]} -eq 1 ]] && echo "y" || echo "ies") to process."
@@ -7479,8 +7520,19 @@ main() {
         exit 1
     fi
 
-    # Convert to absolute path
-    if ! scan_dir=$(cd "$scan_dir" && pwd); then
+    # Convert to an absolute, symlink-resolved path.
+    #
+    # `pwd -P` (physical), not the default logical `pwd`: `find` does not descend into
+    # a start path that is itself a symlink, and the logical form preserves the
+    # symlink. Scanning `/work` (a symlink to `/Volumes/Work`) collected ZERO files and
+    # reported "No indicators of Shai-Hulud compromise detected" — a clean bill of
+    # health for a tree that was never opened. A trailing slash happens to make `find`
+    # resolve it, but the logical `pwd` strips that too, so `/work/` failed identically.
+    #
+    # Symlinked scan roots are ordinary: /work -> /Volumes/Work, /opt/<x> -> elsewhere,
+    # macOS /tmp -> /private/tmp, and any bind-mount-style layout. Resolving here means
+    # every downstream consumer (find, GREP_BASE, the reports) sees a real path.
+    if ! scan_dir=$(cd "$scan_dir" && pwd -P); then
         print_status "$RED" "Error: Unable to access directory '$scan_dir' or convert to absolute path."
         exit 1
     fi

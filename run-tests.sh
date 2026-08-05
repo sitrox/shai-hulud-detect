@@ -947,6 +947,85 @@ else
 fi
 
 # ============================================================
+#  Symlinked scan root must be resolved, not scanned as a symlink
+# ============================================================
+# `find` does not descend a start path that is itself a symlink, and main() used the
+# default LOGICAL `pwd`, which preserves the symlink. Scanning /work (a symlink to
+# /Volumes/Work) collected zero files and printed "No indicators of Shai-Hulud
+# compromise detected" — a clean bill of health for a tree that was never opened.
+# --bulk was hit the same way: "No projects found". A trailing slash makes `find`
+# resolve the link, but the logical `pwd` strips it, so `/work/` failed identically.
+# Symlinked roots are ordinary: /work -> /Volumes/Work, macOS /tmp -> /private/tmp.
+SYMROOT_TMP=$(mktemp -d)
+mkdir -p "$SYMROOT_TMP/real/proj"
+# Inert: a compromised version string in a manifest, nothing executable.
+printf '{"name":"p","version":"1.0.0","dependencies":{"keyv":"6.0.0"}}\n' \
+    > "$SYMROOT_TMP/real/proj/package.json"
+ln -s "$SYMROOT_TMP/real" "$SYMROOT_TMP/link"
+
+((total++))
+SYMROOT_OUT=$("$BASH_CMD" "$DETECTOR" "$SYMROOT_TMP/link" 2>&1)
+if grep -qF "keyv@6.0.0" <<< "$SYMROOT_OUT"; then
+    echo -e "${GREEN}PASS${NC}: symlinked scan root is resolved (plain scan)"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: symlinked scan root scanned nothing and reported clean (plain scan)"
+    ((failed++))
+fi
+
+((total++))
+SYMROOT_BULK=$("$BASH_CMD" "$DETECTOR" --bulk --bulk-list "$SYMROOT_TMP/link" 2>&1)
+if grep -q "/proj$" <<< "$SYMROOT_BULK"; then
+    echo -e "${GREEN}PASS${NC}: symlinked scan root is resolved (--bulk discovery)"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --bulk found no projects under a symlinked root"
+    ((failed++))
+fi
+rm -rf "$SYMROOT_TMP"
+
+# ============================================================
+#  trufflehog findings must keep their own severity in --save-log / --json
+# ============================================================
+# trufflehog_activity.txt stores "path:SEVERITY:message" and mixes HIGH/MEDIUM/LOW.
+# The --save-log and --json writers dumped the WHOLE file as HIGH, so a file that
+# merely mentions trufflehog (a MEDIUM finding) was recorded as HIGH. Under --bulk this
+# produced self-contradicting rows: "🟡 MEDIUM RISK (H:4 M:0 L:0)" — the label comes
+# from the child exit code (correctly MEDIUM), the counts from the log (wrongly HIGH).
+TH_TMP=$(mktemp -d)
+mkdir -p "$TH_TMP/med"
+printf '{"name":"m","version":"1.0.0"}\n' > "$TH_TMP/med/package.json"
+# Inert: a bare reference to the tool name, which is what grades MEDIUM.
+printf 'const scanner = "trufflehog";\n' > "$TH_TMP/med/scan.js"
+
+((total++))
+"$BASH_CMD" "$DETECTOR" --save-log "$TH_TMP/med.log" "$TH_TMP/med" >/dev/null 2>&1
+TH_HIGH=$(awk '$0=="# HIGH"{s=1;next} /^# /{s=0} s&&length($0)>0{c++} END{print c+0}' "$TH_TMP/med.log")
+TH_MED=$(awk '$0=="# MEDIUM"{s=1;next} /^# /{s=0} s&&length($0)>0{c++} END{print c+0}' "$TH_TMP/med.log")
+if [[ "$TH_HIGH" -eq 0 && "$TH_MED" -ge 1 ]]; then
+    echo -e "${GREEN}PASS${NC}: MEDIUM trufflehog finding is logged as MEDIUM, not HIGH"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: trufflehog severity mis-graded in --save-log (HIGH=$TH_HIGH MEDIUM=$TH_MED)"
+    ((failed++))
+fi
+
+if command -v jq >/dev/null 2>&1; then
+    ((total++))
+    "$BASH_CMD" "$DETECTOR" --json "$TH_TMP/med.json" "$TH_TMP/med" >/dev/null 2>&1
+    if [[ "$(jq -r '[.findings[]|select(.message|test("trufflehog"))|.severity]|unique|join(",")' "$TH_TMP/med.json" 2>/dev/null)" == "MEDIUM" ]]; then
+        echo -e "${GREEN}PASS${NC}: MEDIUM trufflehog finding is MEDIUM in --json too"
+        ((passed++))
+    else
+        echo -e "${RED}FAIL${NC}: trufflehog severity mis-graded in --json"
+        ((failed++))
+    fi
+else
+    echo -e "${YELLOW}SKIP${NC}: trufflehog --json severity (jq not installed)"
+fi
+rm -rf "$TH_TMP"
+
+# ============================================================
 #  Paranoid-mode confusable-substring regression
 # ============================================================
 # Lock in the fix for the bare-substring false positive (yarn/intern/return/modern
