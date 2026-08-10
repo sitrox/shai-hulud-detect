@@ -1684,6 +1684,90 @@ else
     ((failed++))
 fi
 
+# Test: the --bulk parent resolves the grep backend itself and propagates it.
+# Regression: main() only called select_grep_tool() on the single-scan path, so in
+# bulk mode GREP_TOOL was empty, the --use-* case appended nothing, and the header
+# under-reported the run. Each child still auto-selected, so this was invisible.
+BACKEND_BULK_TMP="$BULK_TMP/backend-propagation"
+mkdir -p "$BACKEND_BULK_TMP/projects/proj-a"
+echo '{"name":"a"}' > "$BACKEND_BULK_TMP/projects/proj-a/package.json"
+backend_bulk_out="$("$BASH_CMD" "$DETECTOR" --bulk --bulk-output "$BACKEND_BULK_TMP/report" \
+    "$BACKEND_BULK_TMP/projects" 2>&1 || true)"
+backend_flags_line="$(grep -m1 "Per-project flags:" <<< "$backend_bulk_out" || true)"
+((total++))
+if grep -qE -- "--use-(ripgrep|git-grep|grep)" <<< "$backend_flags_line"; then
+    echo -e "${GREEN}PASS${NC}: --bulk resolves the grep backend in the parent and propagates it"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --bulk did not propagate a grep backend to its children"
+    echo "  header line: ${backend_flags_line:-<missing>}"
+    ((failed++))
+fi
+
+# ripgrep, when present, must win auto-selection: git grep without -P is the engine
+# that can spend hours on a single minified line, which is why the priority order was
+# inverted. Asserting the concrete tool (not just "some tool") is the point here.
+if ! command -v rg >/dev/null 2>&1; then
+    echo -e "${YELLOW}SKIP${NC}: --bulk auto-selects ripgrep - ripgrep is not installed"
+else
+    ((total++))
+    if grep -q -- "--use-ripgrep" <<< "$backend_flags_line"; then
+        echo -e "${GREEN}PASS${NC}: --bulk auto-selects ripgrep over git grep"
+        ((passed++))
+    else
+        echo -e "${RED}FAIL${NC}: --bulk auto-selected something other than ripgrep"
+        echo "  header line: ${backend_flags_line:-<missing>}"
+        ((failed++))
+    fi
+fi
+
+# Test: --bulk-timeout caps ONE project and lets the run continue.
+# A bulk run is sequential, so before this existed a single project that never
+# finished discarded the whole run: no aggregate report, and every later project
+# unscanned. Any scan costs ~2s wall just to load the compromised-package list, so a
+# 1s ceiling reliably fires even on this two-file fixture.
+TIMEOUT_TMP="$BULK_TMP/project-timeout"
+mkdir -p "$TIMEOUT_TMP/projects/proj-a" "$TIMEOUT_TMP/projects/proj-b"
+echo '{"name":"a"}' > "$TIMEOUT_TMP/projects/proj-a/package.json"
+echo '{"name":"b"}' > "$TIMEOUT_TMP/projects/proj-b/package.json"
+if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+    echo -e "${YELLOW}SKIP${NC}: --bulk-timeout - no timeout/gtimeout command available"
+else
+    ((total++))
+    timeout_out="$("$BASH_CMD" "$DETECTOR" --bulk --bulk-timeout 1 \
+        --bulk-output "$TIMEOUT_TMP/report" "$TIMEOUT_TMP/projects" 2>&1 || true)"
+    timeout_scanned=$(grep -oE "Scanned: [0-9]+" <<< "$timeout_out" | head -1 | grep -oE "[0-9]+" || true)
+    if grep -q "TIMEOUT" <<< "$timeout_out" \
+       && [[ "$timeout_scanned" == "2" ]] \
+       && [[ -f "$TIMEOUT_TMP/report/aggregate-report.md" ]] \
+       && grep -q "TIMEOUT" "$TIMEOUT_TMP/report/aggregate-report.md"; then
+        echo -e "${GREEN}PASS${NC}: --bulk-timeout records a TIMEOUT row and keeps scanning"
+        ((passed++))
+    else
+        echo -e "${RED}FAIL${NC}: --bulk-timeout did not record a TIMEOUT row (scanned=$timeout_scanned)"
+        echo "$timeout_out" | tail -20 | sed 's/^/    /'
+        ((failed++))
+    fi
+fi
+
+# Test: --bulk-timeout 0 disables the ceiling, so a normal project still completes.
+NOTIMEOUT_TMP="$BULK_TMP/project-timeout-off"
+mkdir -p "$NOTIMEOUT_TMP/projects/proj-a"
+echo '{"name":"a"}' > "$NOTIMEOUT_TMP/projects/proj-a/package.json"
+notimeout_out="$("$BASH_CMD" "$DETECTOR" --bulk --bulk-timeout 0 \
+    --bulk-output "$NOTIMEOUT_TMP/report" "$NOTIMEOUT_TMP/projects" 2>&1 || true)"
+((total++))
+if ! grep -q "Per-project limit:" <<< "$notimeout_out" \
+   && ! grep -q "TIMEOUT" <<< "$notimeout_out" \
+   && grep -q "Scanned: 1" <<< "$notimeout_out"; then
+    echo -e "${GREEN}PASS${NC}: --bulk-timeout 0 disables the per-project ceiling"
+    ((passed++))
+else
+    echo -e "${RED}FAIL${NC}: --bulk-timeout 0 did not disable the per-project ceiling"
+    echo "$notimeout_out" | tail -20 | sed 's/^/    /'
+    ((failed++))
+fi
+
 # Cleanup
 rm -rf "$BULK_TMP"
 

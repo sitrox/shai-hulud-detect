@@ -5,6 +5,29 @@ All notable changes to the Shai-Hulud NPM Supply Chain Attack Detector will be d
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.20.1] - 2026-08-10
+
+### Fixed
+- **A single asset-pipeline file could park a scan for hours; one `--bulk` run sat on the same project for 21 hours.** The grep-backend priority was `git-grep > ripgrep > grep`, justified by the comment *"git-grep is fastest (~40% faster than ripgrep) and uses DFA-based regex (no backtracking)"*. The second half of that is not true: without `-P`, `git grep` compiles the pattern with the **system** regex — glibc `regexec` on Linux — which is quadratic-or-worse on long lines containing `.*` alternations. Several IoC patterns are exactly that shape, `check_trufflehog_activity`'s `curl.*trufflehog|wget.*trufflehog|bunExecutable.*trufflehog|download.*trufflehog` among them, and a minified or Sprockets-concatenated `.js` is exactly that input.
+  - Measured on `debian:12-slim` (glibc 2.36, `LC_ALL=C.UTF-8`), one 2 MB single-line `.js` with many `curl`/`download` occurrences and no `trufflehog`, that same pattern: `git grep -li -E` **>200s (killed, still running)**; `git grep -li -P` **<1s**; `rg -li` **<1s**; `grep -liE` **<1s**. The plain-`grep` backend whose usage text warned it "may hang on complex patterns" was in fact the only one of the three that never did.
+  - End-to-end on a fixture repo holding that one file: **74s before, 1s after** — and the cost grows quadratically with line length, which is how a real Rails checkout reached 21 hours with six `git grep` worker threads pinned. Nothing was wrong with the scan; it simply never returned. Because a bulk run is sequential, the 14 projects already completed were lost with it: the aggregate report is only written at the end.
+  - **Impact:** any repository shipping a bundled, minified or concatenated asset — i.e. most front-end and Rails projects. The failure mode is a stall, not a wrong result, so it never surfaced as a bad finding; it surfaced as a scan that looked hung.
+
+### Changed
+- **Backend priority is now `ripgrep > git-grep > grep`, and `git-grep` is only eligible when this `git` was built with PCRE2.** ripgrep matches with finite automata, linear in input length by construction. `git grep` keeps its threading advantage but is invoked with `-P` (`GIT_GREP_RE_FLAG`), so auto-selection never reaches the POSIX engine; a `git` without PCRE2 is skipped in favour of plain `grep`, the safer floor. `git_grep_backend_works()` now answers both questions from the same probe file — one extra `git grep -P` against a sentinel that cannot match (1 = works, 128 = no PCRE2 support) — so this costs no additional `find`.
+  - `--use-git-grep` is still honoured on a PCRE2-less `git`, with a warning, since an explicit flag is a deliberate choice and a slow scan still produces correct results. That is deliberately weaker than the existing unusable-backend fallback, which overrides the flag because *that* failure yields a silent clean bill of health.
+  - The IoC patterns contain no PCRE-only or ERE-only constructs (no `\s`, `\d`, `\b`), so `-P` is a pure engine swap here. The full suite passes on all four backends, including the 30-case destructive-regex parity block from 3.14.4.
+- **`--bulk` now resolves its own grep backend.** `main()` calls `select_grep_tool()` only on the single-scan path, so in bulk mode `GREP_TOOL` was empty unless the operator passed `--use-*`: the flag-propagation `case` appended nothing and the `Per-project flags:` header under-reported the run. Children each auto-selected for themselves, so results were unaffected — but a fleet-wide backend problem showed up 91 times instead of once, and the header could not be trusted. `run_bulk_scan` now resolves the backend up front, probing against the first readable root, and clears `GREP_BASE` afterwards since the parent runs no searches of its own.
+
+### Added
+- **`--bulk-timeout N`** — wall-clock ceiling in seconds for **one** per-project scan (default `3600`, `0` disables). A project that exceeds it is recorded as a `TIMEOUT (>Ns)` row and the run continues, instead of one stuck project silently consuming every project after it. Uses `timeout` (or `gtimeout`); where neither exists the ceiling is skipped with a warning rather than refusing to scan. `timeout -k 30` so a child that ignores `TERM` still gets `KILL`ed, and `124`/`137` map to a `TIMEOUT` label distinct from `SCAN ERROR`, so the operator knows to rescan rather than debug. The default sits far above a legitimate worst case (a 40k-file tree measures ~12 minutes end to end), so it only fires on pathology.
+  - This is the durable half of the fix: the regex change removes *this* stall, the ceiling bounds the *class*. It would have turned the 21-hour incident into one row in an otherwise complete report.
+
+### Changed (metadata)
+- **`shai-hulud-detector.sh`**: `SCRIPT_VERSION` → 3.20.1.
+- **`run-tests.sh`**: four new `--bulk` assertions — backend resolved and propagated by the parent, ripgrep wins auto-selection when installed, `--bulk-timeout 1` records a `TIMEOUT` row and keeps scanning, `--bulk-timeout 0` disables the ceiling. Suite: 279 → **283** checks, and ~2 minutes faster now that ripgrep is the default backend.
+- **`README.md`**: tests badge and suite count 279 → 283; documented `--bulk-timeout` and the corrected backend priority.
+
 ## [3.14.4] - 2026-08-06
 
 ### Fixed

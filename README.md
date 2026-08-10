@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Shell](https://img.shields.io/badge/shell-Bash%205.0%2B-blue)](#requirements)
 [![Status](https://img.shields.io/badge/status-Active-success)](../../)
-[![Tests](https://img.shields.io/badge/tests-279%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-283%20passing-brightgreen)](#testing)
 [![Packages](https://img.shields.io/badge/compromised%20packages-3%2C460%2B-red)](compromised-packages.txt)
 [![Type](https://img.shields.io/badge/type-Security%20Tool-red)](#what-it-catches)
 [![Contributions](https://img.shields.io/badge/contributions-Welcome-orange)](#contributing)
@@ -184,10 +184,11 @@ For CI gates and tooling that consume findings as data (rather than parsing cons
 | `--check-semver-ranges` | Flag `^`/`~` ranges that could resolve to compromised versions (informational, LOW risk). |
 | `--ecosystem LIST` | Restrict checks to `npm`, `pypi`, `all`, or a comma-separated list. Default: auto-detect. |
 | `--parallelism N` | Threads for parallelisable steps. Defaults to your CPU count. |
-| `--use-git-grep` / `--use-ripgrep` / `--use-grep` | Force a specific grep tool. Default: auto-select fastest available. |
+| `--use-git-grep` / `--use-ripgrep` / `--use-grep` | Force a specific grep tool. Default: auto-select `ripgrep` > `git grep` (only when built with PCRE2) > `grep`. |
 | `--bulk-depth N` | Depth cap for bulk discovery (default 3). `--bulk-depth 1` = flat. |
 | `--bulk-list` | With `--bulk`: print what would be scanned and exit. |
 | `--bulk-output DIR` | Where to write the bulk report (default `./shai-hulud-bulk-report-<timestamp>/`). |
+| `--bulk-timeout N` | Seconds one per-project scan may take before it is recorded as `TIMEOUT` and the run moves on (default 3600, `0` = no limit). Requires `timeout`/`gtimeout`. |
 
 ## How it works
 
@@ -253,7 +254,7 @@ To add new packages from a fresh advisory: append entries in that format, run `.
 ## Testing
 
 ```bash
-./run-tests.sh                          # full suite, 279 checks
+./run-tests.sh                          # full suite, 283 checks
 ./shai-hulud-detector.sh test-cases/<fixture-name>   # run one fixture manually
 ```
 

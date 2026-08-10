@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPROMISED_PACKAGES_FILE="$SCRIPT_DIR/compromised-packages.txt"
 
 # Tool version (surfaced in --json output for downstream consumers)
-SCRIPT_VERSION="3.20.0"
+SCRIPT_VERSION="3.20.1"
 
 # Global temp directory for file-based storage
 TEMP_DIR=""
@@ -53,6 +53,18 @@ BULK_LIST=false
 # always taken whole regardless of depth, so monorepos are never split; the cap only
 # limits how far we keep descending through nested bucket folders.
 BULK_DEPTH=3
+# Wall-clock ceiling, in seconds, for ONE per-project scan in --bulk mode (0 disables).
+#
+# A bulk run is sequential, so a single project that never finishes takes the whole run
+# with it: no aggregate report is written, and every project after it is simply never
+# scanned. That is not hypothetical — a 91-project run sat on project 15 for 21 hours,
+# and the 14 completed scans were unrecoverable because the report is only written at
+# the end. A ceiling converts that class of failure from "the run is lost" into one
+# TIMEOUT row the operator can rescan on its own.
+#
+# 3600s is deliberately far above a legitimate worst case (a 40k-file tree measures
+# ~12 minutes end to end) so it only ever fires on pathology, not on big repositories.
+BULK_PROJECT_TIMEOUT=3600
 # Non-hidden directory basenames that --bulk project discovery never descends into
 # (hidden dirs like .git/.venv/.cache are skipped separately). Leading/trailing spaces
 # matter: membership is tested with the pattern *" $name "*.
@@ -185,8 +197,33 @@ ORANGE='\033[38;5;172m'  # Muted orange for stage headers (256-color mode)
 NC='\033[0m' # No Color
 
 # Detect available grep tools at startup
-# Priority order: git-grep > ripgrep > grep
-# git-grep is fastest (~40% faster than ripgrep) and uses DFA-based regex (no backtracking)
+# Priority order: ripgrep > git-grep (PCRE2 only) > grep
+#
+# This order used to be git-grep first, on the premise that "git grep uses DFA-based
+# regex (no backtracking)". That premise is wrong: without -P, git grep compiles the
+# pattern with the system regex (glibc regexec on Linux), which is quadratic-or-worse
+# on long lines containing `.*` alternations. Several of the IoC patterns are exactly
+# that shape (check_trufflehog_activity's "curl.*trufflehog|wget.*trufflehog|…"), and a
+# minified or asset-pipeline-concatenated .js file is exactly that input.
+#
+# Measured on debian:12 (glibc 2.36, LC_ALL=C.UTF-8), one 2 MB single-line .js with
+# many `curl`/`download` occurrences and no `trufflehog`, that same pattern:
+#
+#   git grep -li --no-index -E    >200s (killed; still running)
+#   git grep -li --no-index -P      <1s
+#   rg -li                          <1s
+#   grep -liE                       <1s
+#
+# It is not a theoretical bound: a real Rails checkout parked one bulk scan on a single
+# git grep for 21 hours, six worker threads pinned, before it was killed. So:
+#
+#   - ripgrep first. Finite-automata matching, linear in input length by construction.
+#   - git grep second, and ONLY when this git was built with PCRE2, so the backend can
+#     run -P. It keeps its parallelism advantage without the regex hazard.
+#   - plain grep last. GNU/BSD grep handle these patterns linearly (measured above);
+#     they are just slower overall because there is no threading.
+#
+# A git without PCRE2 is therefore never auto-selected — plain grep is the safer floor.
 
 HAS_GIT_GREP=false
 HAS_RIPGREP=false
@@ -216,11 +253,16 @@ GREP_TOOL=""
 GREP_BASE=""
 GREP_BASE_PREFIX=""
 
+# Regex flag the git-grep backend passes to `git grep`. "-P" (PCRE2) whenever this git
+# supports it, "-E" otherwise. Set by git_grep_backend_works(); see the priority note at
+# the top of this section for why -E on this backend is a hazard rather than a fallback.
+GIT_GREP_RE_FLAG="-E"
+
 # Semver range checking (opt-in via --check-semver-ranges flag)
 CHECK_SEMVER_RANGES=false
 
 # Function: select_grep_tool
-# Purpose: Auto-select the best available grep tool (git-grep > ripgrep > grep)
+# Purpose: Auto-select the best available grep tool (ripgrep > git-grep > grep)
 # Called after argument parsing to allow --use-* flags to override
 select_grep_tool() {
     # If the user specified a tool via flag, honour it (already set in GREP_TOOL) —
@@ -228,9 +270,20 @@ select_grep_tool() {
     # Silently reporting a compromised tree as clean is a worse outcome than not
     # honouring the flag, so warn and fall through to auto-selection instead.
     if [[ -n "$GREP_TOOL" ]]; then
-        if [[ "$GREP_TOOL" == "git-grep" ]] && ! git_grep_backend_works; then
-            print_status "$YELLOW" "   Note: git grep cannot search '$GREP_BASE' in this environment; falling back to another tool."
-            GREP_TOOL=""
+        if [[ "$GREP_TOOL" == "git-grep" ]]; then
+            if ! git_grep_backend_works; then
+                print_status "$YELLOW" "   Note: git grep cannot search '$GREP_BASE' in this environment; falling back to another tool."
+                GREP_TOOL=""
+            else
+                # Honoured, but a git without PCRE2 has to fall back to -E, which is the
+                # engine that can spend hours on one minified line. An explicit flag is a
+                # deliberate choice, so this warns rather than overriding — unlike the
+                # unusable-backend case above, a slow scan still produces correct results.
+                if [[ "$GIT_GREP_RE_FLAG" != "-P" ]]; then
+                    print_status "$YELLOW" "   Warning: this git has no PCRE2 support, so git grep runs POSIX -E. On trees with minified or concatenated assets that can take hours on a single file; prefer --use-ripgrep or --use-grep there."
+                fi
+                return 0
+            fi
         else
             # Explicit `return 0`: a bare `return` yields the status of the preceding
             # test, which is non-zero here and would abort the script under `set -e`.
@@ -238,11 +291,11 @@ select_grep_tool() {
         fi
     fi
 
-    # Auto-select: git-grep > ripgrep > grep
-    if [[ "$HAS_GIT_GREP" == "true" ]] && git_grep_backend_works; then
-        GREP_TOOL="git-grep"
-    elif [[ "$HAS_RIPGREP" == "true" ]]; then
+    # Auto-select: ripgrep > git-grep (PCRE2 only) > grep
+    if [[ "$HAS_RIPGREP" == "true" ]]; then
         GREP_TOOL="ripgrep"
+    elif [[ "$HAS_GIT_GREP" == "true" ]] && git_grep_backend_works && [[ "$GIT_GREP_RE_FLAG" == "-P" ]]; then
+        GREP_TOOL="git-grep"
     else
         GREP_TOOL="grep"
     fi
@@ -253,7 +306,11 @@ select_grep_tool() {
 #          the backend is used. Searches one real file under the scan root for a sentinel
 #          that cannot occur: a working git exits 1 ("no match"), a git that cannot
 #          address the tree exits 128.
+#          Also decides which regex flag the backend uses, since both answers come from
+#          the same probe file: GIT_GREP_RE_FLAG is set to -P when this git was built
+#          with PCRE2 and -E otherwise.
 # Args: None (reads GREP_BASE)
+# Modifies: GIT_GREP_RE_FLAG
 # Returns: 0 if git grep ran successfully, 1 otherwise
 # Note: A git grep that cannot search the given paths exits non-zero and prints to
 #       stderr, which the fast_grep_* helpers discard (`2>/dev/null || true`) — so the
@@ -264,6 +321,7 @@ select_grep_tool() {
 #       scratch directory is what makes those cases visible; it costs one `find` and
 #       one `git` per run.
 git_grep_backend_works() {
+    GIT_GREP_RE_FLAG="-E"
     [[ -n "$GREP_BASE" && -d "$GREP_BASE" ]] || return 1
 
     # Any regular file will do; -quit stops at the first hit so this stays cheap even
@@ -271,16 +329,30 @@ git_grep_backend_works() {
     local probe_file
     probe_file=$(find "$GREP_BASE" -type f -print -quit 2>/dev/null) || true
     [[ -n "$probe_file" ]] || return 1
+    local probe_spec
+    probe_spec="$(grep_path_to_base "$probe_file")"
 
     # Explicit rc capture: `set -e` must not see the expected non-zero exit, and the
     # distinction between the exit codes is the whole point of the probe.
     local rc=0
     git -C "$GREP_BASE" grep -q --no-index -F \
-        "__shai_hulud_grep_probe_no_match__" -- "$(grep_path_to_base "$probe_file")" \
+        "__shai_hulud_grep_probe_no_match__" -- "$probe_spec" \
         >/dev/null 2>&1 || rc=$?
 
     # 1 = ran fine, found nothing (expected). 128 = cannot address the tree.
-    [[ $rc -eq 1 ]]
+    [[ $rc -eq 1 ]] || return 1
+
+    # Second probe, same file: is PCRE2 compiled in? A git built --with-pcre2 exits 1
+    # (no match) exactly like the probe above; one built without it exits 128 with
+    # "cannot be used without PCRE support". This is what decides whether the backend
+    # is eligible at all during auto-selection.
+    rc=0
+    git -C "$GREP_BASE" grep -q --no-index -P \
+        "__shai_hulud_pcre_probe_no_match__" -- "$probe_spec" \
+        >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 1 ]] && GIT_GREP_RE_FLAG="-P"
+
+    return 0
 }
 
 # Known malicious file hashed (source: https://socket.dev/blog/ongoing-supply-chain-attack-targets-crowdstrike-npm-packages)
@@ -881,18 +953,26 @@ usage() {
     echo "                     .venv/... and hidden directories are not descended into. Multiple"
     echo "                     parent directories may be given; the detector's own repo is skipped."
     echo "                     --paranoid / --check-semver-ranges / --ecosystem / --parallelism"
-    echo "                     are passed through to every per-project scan."
+    echo "                     and the resolved grep backend are passed through to every"
+    echo "                     per-project scan."
     echo "  --bulk-depth N     How many levels below each --bulk parent to descend looking for"
     echo "                     projects (default: ${BULK_DEPTH}). Use 1 for the old flat behaviour"
     echo "                     (each immediate subdirectory is one project)."
     echo "  --bulk-list        With --bulk: print the projects that would be scanned (one absolute"
     echo "                     path per line) and exit, without scanning or writing a report."
     echo "  --bulk-output DIR  Directory for the bulk report (default: ./shai-hulud-bulk-report-<timestamp>)."
+    echo "  --bulk-timeout N   Wall-clock ceiling in seconds for ONE per-project scan (default:"
+    echo "                     ${BULK_PROJECT_TIMEOUT}, 0 = no limit). A project that exceeds it is recorded as a"
+    echo "                     TIMEOUT row and the run continues, instead of one stuck project"
+    echo "                     blocking every project after it. Needs 'timeout' (or 'gtimeout')"
+    echo "                     on PATH; without one the limit is skipped with a warning."
     echo ""
-    echo "GREP TOOL SELECTION (auto-selects fastest available by default: git-grep > ripgrep > grep):"
-    echo "  --use-git-grep     Force use of git grep (fastest, DFA-based, no backtracking)"
-    echo "  --use-ripgrep      Force use of ripgrep (rg)"
-    echo "  --use-grep         Force use of standard grep (may hang on complex patterns)"
+    echo "GREP TOOL SELECTION (auto-selects by default: ripgrep > git-grep with PCRE2 > grep):"
+    echo "  --use-git-grep     Force use of git grep. Fast and threaded, but WITHOUT PCRE2 it uses"
+    echo "                     the system POSIX engine, which can take hours on one minified line;"
+    echo "                     auto-selection therefore skips a git built without PCRE2."
+    echo "  --use-ripgrep      Force use of ripgrep (rg). Linear-time matching; the default choice."
+    echo "  --use-grep         Force use of standard grep (single-threaded, but linear-time)"
     echo ""
     echo "EXAMPLES:"
     echo "  $0 /path/to/your/project                    # Core Shai-Hulud detection only"
@@ -1045,13 +1125,15 @@ fast_grep_files() {
     [[ -z "$input" ]] && return 0
     case "$GREP_TOOL" in
         git-grep)
-            # git grep uses DFA-based regex (no backtracking) - safe for complex patterns
             # --no-index allows searching files not managed by git.
             # Paths must be relative to GREP_BASE — see grep_paths_to_base().
+            # GIT_GREP_RE_FLAG is -P (PCRE2) whenever this git supports it; the -E
+            # fallback is only reachable via an explicit --use-git-grep, because
+            # auto-selection refuses a PCRE2-less git. See select_grep_tool().
             local outside matched
             outside="$(grep_outside_file)"
             matched=$(printf '%s\n' "$input" | grep_paths_to_base "$outside" | \
-                xargs -0 git -C "${GREP_BASE:-.}" grep -l --no-index -E "$pattern" -- 2>/dev/null) || true
+                xargs -0 git -C "${GREP_BASE:-.}" grep -l --no-index "$GIT_GREP_RE_FLAG" "$pattern" -- 2>/dev/null) || true
             grep_paths_from_base "$matched"
             if [[ -n "$outside" ]]; then
                 # Paths outside GREP_BASE are not expressible as a git pathspec, so
@@ -1087,7 +1169,7 @@ fast_grep_files_i() {
             local outside matched
             outside="$(grep_outside_file)"
             matched=$(printf '%s\n' "$input" | grep_paths_to_base "$outside" | \
-                xargs -0 git -C "${GREP_BASE:-.}" grep -li --no-index -E "$pattern" -- 2>/dev/null) || true
+                xargs -0 git -C "${GREP_BASE:-.}" grep -li --no-index "$GIT_GREP_RE_FLAG" "$pattern" -- 2>/dev/null) || true
             grep_paths_from_base "$matched"
             if [[ -n "$outside" ]]; then
                 # See fast_grep_files() — out-of-base paths fall back to plain grep.
@@ -1154,7 +1236,7 @@ fast_grep_quiet() {
             # grep cannot address those at all, and its failure is indistinguishable
             # from "no match" here, so fall back to plain grep instead.
             if grep_path_in_base "$file"; then
-                git -C "${GREP_BASE:-.}" grep -q --no-index -E "$pattern" \
+                git -C "${GREP_BASE:-.}" grep -q --no-index "$GIT_GREP_RE_FLAG" "$pattern" \
                     -- "$(grep_path_to_base "$file")" 2>/dev/null
             else
                 grep -qE "$pattern" "$file" 2>/dev/null
@@ -7102,6 +7184,27 @@ run_bulk_scan() {
     local self_repo=""
     [[ -d "$SCRIPT_DIR" ]] && self_repo="$(cd "$SCRIPT_DIR" 2>/dev/null && pwd || true)"
 
+    # Resolve the search backend HERE, in the parent. main() only calls
+    # select_grep_tool() on the single-scan path, so in bulk mode GREP_TOOL was empty
+    # unless the operator passed --use-*: the case below then appended nothing and the
+    # "Per-project flags:" header quietly under-reported what the run would do. The
+    # children each auto-selected for themselves, which was harmless but invisible —
+    # and it meant a fleet-wide backend problem showed up 91 times instead of once.
+    #
+    # Auto-selection needs a real directory for the git-grep probe, so borrow the first
+    # readable root; every child re-anchors GREP_BASE at its own project anyway. The
+    # base is cleared afterwards because this process runs no searches of its own.
+    if [[ -z "$GREP_TOOL" ]]; then
+        local _probe_root
+        for _probe_root in "${roots[@]}"; do
+            [[ -d "$_probe_root" ]] || continue
+            set_grep_base "$(cd "$_probe_root" 2>/dev/null && pwd -P || true)"
+            break
+        done
+        select_grep_tool
+        set_grep_base ""
+    fi
+
     # Flags propagated to every per-project scan.
     local child_flags=()
     [[ "$paranoid_mode" == "true" ]] && child_flags+=("--paranoid")
@@ -7113,6 +7216,18 @@ run_bulk_scan() {
         ripgrep)  child_flags+=("--use-ripgrep")  ;;
         grep)     child_flags+=("--use-grep")     ;;
     esac
+
+    # Per-project wall-clock ceiling (see BULK_PROJECT_TIMEOUT). GNU coreutils' timeout
+    # is not universal — macOS ships it only as gtimeout via Homebrew — so this degrades
+    # to running unguarded rather than refusing to scan, and says so once.
+    local timeout_cmd=""
+    if [[ "$BULK_PROJECT_TIMEOUT" -gt 0 ]]; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout_cmd="timeout"
+        elif command -v gtimeout >/dev/null 2>&1; then
+            timeout_cmd="gtimeout"
+        fi
+    fi
 
     # Hardening (b): resolve --bulk-output to an absolute path BEFORE discovery so
     # _bulk_discover can refuse to descend into it. The directory itself is created
@@ -7249,6 +7364,11 @@ run_bulk_scan() {
     print_status "$BLUE"  "Roots:             $resolved_roots"
     print_status "$BLUE"  "Per-project flags: ${child_flags[*]}"
     print_status "$BLUE"  "Output directory:  $out_dir"
+    if [[ -n "$timeout_cmd" ]]; then
+        print_status "$BLUE"  "Per-project limit: ${BULK_PROJECT_TIMEOUT}s (--bulk-timeout 0 disables)"
+    elif [[ "$BULK_PROJECT_TIMEOUT" -gt 0 ]]; then
+        print_status "$YELLOW" "Per-project limit: disabled — no 'timeout' command found (macOS: brew install coreutils). A single stuck project will block the whole run."
+    fi
     echo
 
     local rows_file="$TEMP_DIR/bulk_rows.tsv"
@@ -7283,7 +7403,14 @@ run_bulk_scan() {
         printf '%b[%2d/%d]%b SCAN  %s ... ' "$BLUE" "$idx" "${#targets[@]}" "$NC" "$name"
 
         rc=0
-        "$self_bash" "$self_script" "${child_flags[@]}" --save-log "$repo_log" "$t" > "$raw_tmp" 2>&1 || rc=$?
+        if [[ -n "$timeout_cmd" ]]; then
+            # -k: a child that ignores TERM (or whose own children do) still gets KILLed,
+            # so the ceiling is a real ceiling. timeout reports 124 on TERM, 137 on KILL.
+            "$timeout_cmd" -k 30 "$BULK_PROJECT_TIMEOUT" \
+                "$self_bash" "$self_script" "${child_flags[@]}" --save-log "$repo_log" "$t" > "$raw_tmp" 2>&1 || rc=$?
+        else
+            "$self_bash" "$self_script" "${child_flags[@]}" --save-log "$repo_log" "$t" > "$raw_tmp" 2>&1 || rc=$?
+        fi
         # Strip ANSI colour codes so the saved console log is plain text.
         sed $'s/\x1b[^m]*m//g' "$raw_tmp" > "$console_log" 2>/dev/null || cp "$raw_tmp" "$console_log" 2>/dev/null || true
 
@@ -7303,6 +7430,10 @@ run_bulk_scan() {
                    fi ;;
                 *) sev=1; emoji="⚠️"; label="completed, exit $rc"; color="$YELLOW"; n_error=$((n_error + 1)) ;;
             esac
+        elif [[ -n "$timeout_cmd" && ( "$rc" -eq 124 || "$rc" -eq 137 ) ]]; then
+            # Distinct from a crash: the scan was cut off, not broken. Named as such so
+            # the operator knows to rescan this one project rather than debug it.
+            sev=1; emoji="⏱️"; label="TIMEOUT (>${BULK_PROJECT_TIMEOUT}s)"; color="$RED"; n_error=$((n_error + 1))
         else
             sev=1; emoji="⚠️"; label="SCAN ERROR (exit $rc)"; color="$RED"; n_error=$((n_error + 1))
         fi
@@ -7457,6 +7588,22 @@ main() {
                 BULK_DEPTH="${1#--bulk-depth=}"
                 if ! [[ $BULK_DEPTH =~ ^[1-9][0-9]*$ ]]; then
                     echo "${RED}error: --bulk-depth= requires a positive integer${NC}" >&2
+                    usage
+                fi
+                ;;
+            --bulk-timeout)
+                re='^[0-9]+$'
+                if ! [[ $2 =~ $re ]]; then
+                    echo "${RED}error: --bulk-timeout requires a non-negative integer (seconds, 0 = no limit)${NC}" >&2
+                    usage
+                fi
+                BULK_PROJECT_TIMEOUT=$2
+                shift
+                ;;
+            --bulk-timeout=*)
+                BULK_PROJECT_TIMEOUT="${1#--bulk-timeout=}"
+                if ! [[ $BULK_PROJECT_TIMEOUT =~ ^[0-9]+$ ]]; then
+                    echo "${RED}error: --bulk-timeout= requires a non-negative integer (seconds, 0 = no limit)${NC}" >&2
                     usage
                 fi
                 ;;
